@@ -6,7 +6,8 @@
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "nodemon --env-file=.env src/server.js"
+    "dev": "nodemon --env-file=.env src/server.js",
+    "build": "npm rebuild sqlite3 --build-from-source"
   },
   "dependencies": {
     "bcryptjs": "^3.0.3",
