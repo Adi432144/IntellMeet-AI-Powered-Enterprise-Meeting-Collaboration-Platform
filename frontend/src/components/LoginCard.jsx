@@ -17,7 +17,7 @@ export default function LoginCard({ onAuthSuccess }) {
     const payload = isRegisterMode ? { name, email, password } : { email, password };
 
     try {
-      const response = await fetch(`http://localhost:8080${endpoint}`, {
+      const response = await fetch(`https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com${endpoint}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
