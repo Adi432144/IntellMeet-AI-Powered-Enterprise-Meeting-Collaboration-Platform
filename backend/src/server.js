@@ -22,7 +22,7 @@ app.use(cors({ origin: '*' }));
 // Expose the PDF download files securely to the public client context
 app.use('/session_reports', express.static(path.join(process.cwd(), 'session_reports')));
 
-const PORT = 8080;
+const PORT = process.env.PORT || 8080;
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
