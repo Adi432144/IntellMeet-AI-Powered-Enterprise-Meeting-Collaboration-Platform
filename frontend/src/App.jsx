@@ -9,7 +9,7 @@ import { io } from 'socket.io-client';
 import LoginCard from './components/LoginCard';
 
 // Initialize socket client outside component lifecycle to prevent duplicate connection instances
-const socket = io('http://localhost:8080', {
+const socket = io('https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com', {
   autoConnect: false, // Controlled explicitly via security lifecycle states
   reconnectionAttempts: 5,
   timeout: 10000
@@ -173,7 +173,7 @@ export default function App() {
   const clearSessionHistoryCache = async () => {
     if (!window.confirm("Are you sure you want to completely clear the historic session cache storage?")) return;
     try {
-      const res = await fetch('http://localhost:8080/api/history', { method: 'DELETE' });
+      const res = await fetch('https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com/api/history', { method: 'DELETE' });
       if (res.ok) {
         setHistoryLogs([]);
         setSummaryStats({ totalMeetings: 0, totalMinutes: 0, avgEngagement: 0, peakUsersAllTime: 0 });
@@ -205,11 +205,11 @@ export default function App() {
 
   const loadHistoricalAnalytics = async () => {
     try {
-      const resHist = await fetch('http://localhost:8080/api/history');
+      const resHist = await fetch('https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com/api/history');
       const dataHist = await resHist.json();
       setHistoryLogs(Array.isArray(dataHist) ? dataHist : [dataHist]);
 
-      const resStat = await fetch('http://localhost:8080/api/analytics/summary');
+      const resStat = await fetch('https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com/api/analytics/summary');
       const dataStat = await resStat.json();
       setSummaryStats(dataStat);
     } catch (err) {
@@ -646,7 +646,7 @@ export default function App() {
 
   const triggerMockTelemetryPayloadInjection = async () => {
     try {
-      const res = await fetch('http://localhost:8080/api/simulate-telemetry', {
+      const res = await fetch('https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com/api/simulate-telemetry', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId })
@@ -1083,7 +1083,7 @@ export default function App() {
                         style={{ ...currentStyles.themeToggleBtn, backgroundColor: 'rgba(56,189,248,0.1)', border: '1px solid #38bdf8', color: '#38bdf8' }}
                         onClick={async () => {
                           try {
-                            const response = await fetch('http://localhost:8080/api/reports');
+                            const response = await fetch('https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com/api/reports');
                             const files = await response.json();
                             const targetFile = files
                               .filter(file => file.includes(cleanRoomId))
@@ -1091,7 +1091,7 @@ export default function App() {
                               .pop();
 
                             if (targetFile) {
-                              window.open(`http://localhost:8080/session_reports/${targetFile}`, '_blank');
+                              window.open(`https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com/session_reports/${targetFile}`, '_blank');
                             } else {
                               alert(`No binary PDF report asset found compiled yet for room code: ${cleanRoomId}.`);
                             }
