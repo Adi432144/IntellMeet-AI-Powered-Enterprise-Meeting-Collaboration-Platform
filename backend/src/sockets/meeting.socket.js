@@ -1,99 +1,67 @@
-// backend/src/sockets/meeting.socket.js
-import fs from 'fs/promises';
-import path from 'path';
-
-const jsonPath = path.resolve(process.cwd(), 'chats.json');
-
 /**
- * Orchestrates real-time WebRTC signaling, peer discovery, and live chat 
- * events for specific room spaces within IntellMeet.
+ * WebRTC Signaling & Chat Socket Controller
+ * Coordinates peer handshakes and manages room states.
  */
 export const handleMeetingSockets = (io, socket) => {
   
-  // 1. Room Management & Joining Matrix
-  socket.on('join-room', async ({ roomId, userId, userName }) => {
+  // 1. Client requests entry into a room container
+  socket.on('join-room', ({ roomId, userId, userName }) => {
     socket.roomId = roomId;
     socket.userId = userId;
     socket.userName = userName;
-
+    
     socket.join(roomId);
-    console.log(`👤 User [${userName}] (${userId}) entered room: [${roomId}]`);
-
-    socket.to(roomId).emit('user-connected', {
-      userId,
-      userName,
-      socketId: socket.id
+    
+    // Broadcast to existing room members that a new peer node is available
+    socket.to(roomId).emit('peer-joined', { 
+      socketId: socket.id, 
+      userId, 
+      userName 
     });
-
-    try {
-      const fileBuffer = await fs.readFile(jsonPath, 'utf-8').catch(() => '[]');
-      const allMessages = JSON.parse(fileBuffer || '[]');
-      const historicalBuffer = allMessages.filter(msg => msg.roomId === roomId);
-      
-      historicalBuffer.forEach(msg => {
-        socket.emit('receive-message', msg);
-      });
-    } catch (err) {
-      console.error(`⚠️ History sync bypass: ${err.message}`);
-    }
+    
+    console.log(`📡 Peer [${userName}] successfully routed to room: ${roomId}`);
   });
 
-  // 2. WebRTC Signaling Infrastructure
-  socket.on('webrtc-offer', ({ targetSocketId, offer }) => {
+  // 2. Relay WebRTC SDP Offer to a specific targeted target peer
+  socket.on('webrtc-offer', ({ targetSocketId, sdp }) => {
     io.to(targetSocketId).emit('webrtc-offer', {
       senderSocketId: socket.id,
-      offer
+      sdp
     });
   });
 
-  socket.on('webrtc-answer', ({ targetSocketId, answer }) => {
+  // 3. Relay WebRTC SDP Answer back to the initial offer originator
+  socket.on('webrtc-answer', ({ targetSocketId, sdp }) => {
     io.to(targetSocketId).emit('webrtc-answer', {
       senderSocketId: socket.id,
-      answer
+      sdp
     });
   });
 
-  socket.on('webrtc-ice-candidate', ({ targetSocketId, candidate }) => {
-    io.to(targetSocketId).emit('webrtc-ice-candidate', {
+  // 4. Transport ICE network routing footprints between devices
+  socket.on('webrtc-candidate', ({ targetSocketId, candidate }) => {
+    io.to(targetSocketId).emit('webrtc-candidate', {
       senderSocketId: socket.id,
       candidate
     });
   });
 
-  // 3. Persistent Live Chat Transactions
-  socket.on('send-message', async ({ text }) => {
-    const { roomId, userName, userId } = socket;
-    if (!roomId) return;
-
+  // 5. Traditional instant message broadcasting
+  socket.on('send-message', (data) => {
     const messagePayload = {
-      id: `${socket.id}-${Date.now()}`,
-      roomId,
-      text,
-      sender: { userId, userName },
+      id: `msg-${Date.now()}`,
+      text: data.text,
+      sender: { userName: socket.userName, userId: socket.userId },
       timestamp: new Date().toISOString()
     };
-
-    try {
-      const fileBuffer = await fs.readFile(jsonPath, 'utf-8').catch(() => '[]');
-      const currentLogs = JSON.parse(fileBuffer || '[]');
-      currentLogs.push(messagePayload);
-      await fs.writeFile(jsonPath, JSON.stringify(currentLogs, null, 2), 'utf-8');
-    } catch (error) {
-      console.error(`💥 Disk Transaction Refused: ${error.message}`);
-    }
-
-    io.to(roomId).emit('receive-message', messagePayload);
+    io.to(socket.roomId).emit('receive-message', messagePayload);
   });
 
-  // 4. Lifecyle Disconnection Core
+  // 6. Handle client disconnect cleanups safely
   socket.on('disconnect', () => {
-    const { roomId, userId, userName } = socket;
-    if (roomId) {
-      console.log(`🔌 User [${userName}] disconnected out of room: [${roomId}]`);
-      socket.to(roomId).emit('user-disconnected', {
-        userId,
-        socketId: socket.id
-      });
+    if (socket.roomId) {
+      io.to(socket.roomId).emit('peer-disconnected', { socketId: socket.id });
+      console.log(`🔌 Peer [${socket.userName}] disconnected from room: ${socket.roomId}`);
     }
   });
 };

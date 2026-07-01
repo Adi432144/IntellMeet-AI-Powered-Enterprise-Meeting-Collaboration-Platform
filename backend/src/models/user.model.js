@@ -1,56 +1,23 @@
-// backend/src/models/user.model.js
 import mongoose from 'mongoose';
+import bcrypt from 'bcryptjs';
 
-/**
- * MongoDB Schema defining an enterprise user account within IntellMeet.
- * Implements strict string sanitization and automated index tracking.
- */
-const userSchema = new mongoose.Schema(
-  {
-    name: {
-      type: String,
-      required: [true, 'User legal name is required'],
-      trim: true,
-      maxlength: [100, 'Name cannot exceed 100 characters'],
-    },
-    email: {
-      type: String,
-      required: [true, 'Enterprise email address is required'],
-      unique: true,
-      trim: true,
-      lowercase: true,
-      match: [
-        /^\w+([\.-]?\w+)*@\w+([\.-]?\w+)*(\.\w{2,3})+$/,
-        'Please provide a valid enterprise email layout',
-      ],
-    },
-    password: {
-      type: String,
-      required: [true, 'Authentication credentials are required'],
-      minlength: [8, 'Password must be at least 8 characters long'],
-    },
-    avatarUrl: {
-      type: String,
-      default: '',
-    },
-    role: {
-      type: String,
-      enum: ['employee', 'manager', 'admin'],
-      default: 'employee',
-    },
-    isActive: {
-      type: Boolean,
-      default: true,
-    },
-  },
-  {
-    timestamps: true, // Automatically manages createdAt and updatedAt fields
-  }
-);
+const userSchema = new mongoose.Schema({
+  userName: { type: String, required: true, unique: true, trim: true },
+  email: { type: String, required: true, unique: true, lowercase: true },
+  password: { type: String, required: true },
+  role: { type: String, enum: ['user', 'admin'], default: 'user' }
+}, { timestamps: true });
 
-// Optimize search speed for email lookups during authentication cycles
-userSchema.index({ email: 1 });
+// Automatically hash password before saving to MongoDB
+userSchema.pre('save', async function (next) {
+  if (!this.isModified('password')) return next();
+  this.password = await bcrypt.hash(this.password, 10);
+  next();
+});
 
-const User = mongoose.model('User', userSchema);
-export default User;
-meetingSchema.index({ roomId: 1 });
+// Helper method to verify passwords during login
+userSchema.methods.comparePassword = async function (candidatePassword) {
+  return bcrypt.compare(candidatePassword, this.password);
+};
+
+export default mongoose.model('User', userSchema);
