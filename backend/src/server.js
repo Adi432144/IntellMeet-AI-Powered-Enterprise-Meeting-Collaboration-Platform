@@ -22,7 +22,10 @@ app.use(cors({ origin: '*' }));
 // Expose the PDF download files securely to the public client context
 app.use('/session_reports', express.static(path.join(process.cwd(), 'session_reports')));
 
-const PORT = process.env.PORT || 8080;
+// Expose persisted full-session audio recordings for direct download
+app.use('/session_audio', express.static(path.join(process.cwd(), 'session_audio')));
+
+const PORT = 8080;
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
@@ -37,6 +40,11 @@ if (!fs.existsSync(TMP_DIR)) {
 const REPORTS_FOLDER_PATH = path.join(process.cwd(), 'session_reports');
 if (!fs.existsSync(REPORTS_FOLDER_PATH)) {
   fs.mkdirSync(REPORTS_FOLDER_PATH, { recursive: true });
+}
+
+const AUDIO_FOLDER_PATH = path.join(process.cwd(), 'session_audio');
+if (!fs.existsSync(AUDIO_FOLDER_PATH)) {
+  fs.mkdirSync(AUDIO_FOLDER_PATH, { recursive: true });
 }
 
 // -------------------------------------------------------------------------
@@ -83,9 +91,20 @@ db.serialize(() => {
       peakParticipants INTEGER NOT NULL,
       engagementScore INTEGER NOT NULL,
       aiSummary TEXT,
+      chatSummary TEXT,
+      audioFileName TEXT,
       actionItems TEXT
     )
-  `);
+  `, (err) => {
+    if (err) return console.error("❌ Failed creating completed_sessions schema:", err.message);
+    // Safe migrations for existing databases created before these columns existed.
+    db.run(`ALTER TABLE completed_sessions ADD COLUMN chatSummary TEXT`, () => {
+      // Ignored on purpose: fails harmlessly with "duplicate column name" if it already exists.
+    });
+    db.run(`ALTER TABLE completed_sessions ADD COLUMN audioFileName TEXT`, () => {
+      // Ignored on purpose: fails harmlessly with "duplicate column name" if it already exists.
+    });
+  });
 
   // Seed default core users if table is empty
   db.get("SELECT COUNT(*) as count FROM users", [], (err, row) => {
@@ -257,18 +276,251 @@ app.get('/api/reports', (req, res) => {
   });
 });
 
+/**
+ * @route GET /api/audio-reports
+ * @description Retrieves a list of all persisted full-session audio recordings from the local filesystem.
+ * Frontend can build a download link/button as: `${SERVER_URL}/session_audio/${filename}`
+ */
+app.get('/api/audio-reports', (req, res) => {
+  fs.readdir(AUDIO_FOLDER_PATH, (err, files) => {
+    if (err) {
+      console.error("❌ Failed to parse session audio filesystem directory:", err.message);
+      return res.status(500).json({ error: "Failed to read session audio storage directory." });
+    }
+    const audioFiles = files.filter(file => file.toLowerCase().endsWith('.webm'));
+    return res.json(audioFiles);
+  });
+});
+
+// =========================================================================
+// REUSABLE AI SUMMARIZATION HELPER (OpenAI API)
+// =========================================================================
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5.4-mini";
+
+/**
+ * Shared low-level caller for OpenAI's Chat Completions API in strict JSON mode.
+ * Returns the parsed JSON object from the model, or null on any failure
+ * (network error, non-OK status, or malformed JSON) — callers handle fallbacks.
+ */
+async function callOpenAIJSON(systemPrompt, userPrompt, maxTokens, logLabel) {
+  if (!process.env.OPENAI_API_KEY) {
+    console.error(`❌ [OPENAI] ${logLabel} request skipped: OPENAI_API_KEY is not set in .env`);
+    return null;
+  }
+
+  try {
+    console.log(`🧠 [OPENAI] Requesting ${logLabel}...`);
+    const response = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: userPrompt }
+        ],
+        response_format: { type: "json_object" },
+        max_tokens: maxTokens,
+        temperature: 0.3
+      })
+    });
+
+    if (!response.ok) {
+      const errBody = await response.text();
+      console.error(`❌ [OPENAI] ${logLabel} request failed. Status: ${response.status}. Body: ${errBody}`);
+      return null;
+    }
+
+    const data = await response.json();
+    const content = data?.choices?.[0]?.message?.content;
+    if (!content) {
+      console.error(`❌ [OPENAI] ${logLabel} response had no message content.`);
+      return null;
+    }
+
+    return JSON.parse(content);
+  } catch (err) {
+    console.error(`❌ [OPENAI] ${logLabel} request threw an exception:`, err.message);
+    return null;
+  }
+}
+
+/**
+ * Derives an engagement score (0-100) and a list of action items from the
+ * combined audio + chat context. Kept separate from the per-channel summaries
+ * below because this needs the full picture to judge engagement / follow-ups.
+ */
+async function generateEngagementAndActionItems(voiceTranscriptText, combinedTextChatContext) {
+  const systemPrompt = "You are an automated system operations analyst. You review meeting telemetry (an audio transcript and a chat log) and respond only with a single JSON object — no prose, no markdown.";
+
+  const userPrompt = `Review this session telemetry:
+
+AUDIO TRANSCRIPT ARCHIVE:
+"${voiceTranscriptText || 'No verbal audio recorded over mic channels.'}"
+
+CHAT FEED DATA RECOVERY:
+"${combinedTextChatContext || 'No chat communications written on track feeds.'}"
+
+Respond with a JSON object containing exactly these keys: "engagementScore" (integer 0-100) and "actionItems" (array of short strings, empty array if none apply).`;
+
+  const fallback = {
+    engagementScore: 75,
+    actionItems: ["Review system connectivity lines for missing audio nodes"]
+  };
+
+  const parsed = await callOpenAIJSON(systemPrompt, userPrompt, 300, "engagement score and action items");
+  if (!parsed) return fallback;
+
+  return {
+    engagementScore: typeof parsed.engagementScore === 'number' ? parsed.engagementScore : fallback.engagementScore,
+    actionItems: Array.isArray(parsed.actionItems) ? parsed.actionItems : fallback.actionItems
+  };
+}
+
+/**
+ * Appends a live audio chunk to the room's temporary cache file on disk.
+ * This is the single point of truth for writing incoming mic buffer data,
+ * so the audio-chunk socket handler and any future producer can reuse it.
+ */
+function cacheAudioChunk(roomId, buffer) {
+  const liveTracker = activeRoomTrackers.get(roomId);
+  if (!liveTracker || !buffer) return;
+
+  fs.appendFile(liveTracker.audioPath, Buffer.from(buffer), (err) => {
+    if (err) console.error(`⚠️ [AUDIO CACHE] Write failure for room "${roomId}":`, err.message);
+  });
+}
+
+/**
+ * Moves a room's cached raw audio file out of the temporary tmp_audio cache
+ * and into the persistent session_audio folder so it can be downloaded later
+ * via the /session_audio static route. Returns the persisted filename, or
+ * null if there was nothing to persist / the move failed.
+ */
+function persistSessionAudio(roomId, tempAudioPath) {
+  if (!fs.existsSync(tempAudioPath)) return null;
+
+  try {
+    const persistedFileName = `SessionAudio_${roomId}_${Date.now()}.webm`;
+    const persistedPath = path.join(AUDIO_FOLDER_PATH, persistedFileName);
+    fs.renameSync(tempAudioPath, persistedPath);
+    console.log(`💾 [AUDIO CACHE] Full session audio persisted for download: ${persistedFileName}`);
+    return persistedFileName;
+  } catch (err) {
+    console.error(`❌ [AUDIO CACHE] Failed to persist session audio for room "${roomId}":`, err.message);
+    return null;
+  }
+}
+
+/**
+ * Single static-prompt AI call that receives BOTH the audio transcript and the
+ * chat log together, and asks the model to independently summarize whichever
+ * channel(s) have data. One OpenAI request covers both channels rather than
+ * making two separate model calls.
+ */
+async function generateChannelSummaries(voiceTranscriptText, chatLogText) {
+  const hasAudio = !!(voiceTranscriptText && voiceTranscriptText.trim());
+  const hasChat = !!(chatLogText && chatLogText.trim());
+
+  const audioEmptyFallback = "No explicit audio telemetry gathered to generate an operations brief.";
+  const chatEmptyFallback = "No explicit historic text chat communications recorded to process.";
+
+  if (!hasAudio && !hasChat) {
+    return { audioSummary: audioEmptyFallback, chatSummary: chatEmptyFallback };
+  }
+
+  const systemPrompt = "You are an enterprise communication analyzer. You are given two possible data channels from a meeting: an AUDIO TRANSCRIPT and a CHAT LOG. Either channel may be empty. Respond only with a single JSON object — no prose, no markdown.";
+
+  const userPrompt = `Instructions:
+- If the AUDIO TRANSCRIPT is not empty, write a concise, professional summary paragraph of it for the "audioSummary" field.
+- If the CHAT LOG is not empty, write a concise, professional summary paragraph of it for the "chatSummary" field.
+- If a channel is marked empty, set that field to exactly: "No data recorded for this channel."
+- Keep each channel's summary based only on that channel's own content — do not blend the two together.
+- Do not use lists, headers, or markdown formatting in either summary.
+
+AUDIO TRANSCRIPT (${hasAudio ? 'has content' : 'empty'}):
+"${hasAudio ? voiceTranscriptText : 'empty'}"
+
+CHAT LOG (${hasChat ? 'has content' : 'empty'}):
+"${hasChat ? chatLogText : 'empty'}"
+
+Respond with a JSON object containing exactly these two keys: "audioSummary" and "chatSummary".`;
+
+  const parsed = await callOpenAIJSON(systemPrompt, userPrompt, 600, "combined audio + chat summaries");
+
+  if (!parsed) {
+    return {
+      audioSummary: hasAudio ? "Automated audio summary unavailable (request failed)." : audioEmptyFallback,
+      chatSummary: hasChat ? "Automated chat summary unavailable (request failed)." : chatEmptyFallback
+    };
+  }
+
+  return {
+    audioSummary: hasAudio ? (parsed.audioSummary || "Audio summary unavailable.") : audioEmptyFallback,
+    chatSummary: hasChat ? (parsed.chatSummary || "Chat summary unavailable.") : chatEmptyFallback
+  };
+}
+
+/**
+ * Checks whether a room name is currently in use by a live session — either
+ * actively tracked with connected participants, or already registered with
+ * security config by a host who created it but hasn't joined yet. Used to
+ * block a duplicate room name from being created in real time.
+ */
+function isRoomNameTaken(roomId) {
+  return activeRoomTrackers.has(roomId) || roomSecurityRegistry.has(roomId);
+}
+
 // =========================================================================
 // WEBRTC MATRIX SIGNALING + REALSURFACE VOICE STORAGE
 // =========================================================================
 io.on('connection', (socket) => {
 
+  // Host Action: Explicit real-time availability check when creating a new room.
+  // Frontend should call this first when the user clicks "Create Room" — before
+  // showing the password field or calling register-session-security — so a
+  // duplicate name is rejected immediately instead of silently merging into
+  // an existing live session.
+  socket.on('create-room', ({ roomId }) => {
+    try {
+      if (isRoomNameTaken(roomId)) {
+        socket.emit('room-creation-failed', {
+          roomId,
+          message: `Room "${roomId}" already exists. Please use a different name, or use Join Session to join the existing room.`
+        });
+        console.log(`⚠️ [Room Creation Blocked] Duplicate room name rejected: "${roomId}"`);
+        return;
+      }
+
+      socket.emit('room-creation-allowed', { roomId });
+      console.log(`🆕 [Room Availability] Room name "${roomId}" is available for creation.`);
+    } catch (err) {
+      console.error("❌ Error checking room name availability:", err.message);
+    }
+  });
+
   // Host Action: Register structural credentials and metadata configuration
   socket.on('register-session-security', ({ roomId, password }) => {
     try {
+      // Safety net in case a client calls this directly without going through
+      // 'create-room' first — still blocks duplicate room names in real time.
+      if (isRoomNameTaken(roomId)) {
+        socket.emit('room-creation-failed', {
+          roomId,
+          message: `Room "${roomId}" already exists. Please use a different name, or use Join Session to join the existing room.`
+        });
+        console.log(`⚠️ [Room Creation Blocked] Duplicate room name rejected: "${roomId}"`);
+        return;
+      }
+
       roomSecurityRegistry.set(roomId, {
         password: password ? password.trim() : '',
         hostSocketId: socket.id
       });
+      socket.emit('room-creation-allowed', { roomId });
       console.log(`🔒 [Security Config] Security parameters saved for room: "${roomId}"`);
     } catch (err) {
       console.error("❌ Failed to register room security criteria:", err.message);
@@ -363,12 +615,7 @@ io.on('connection', (socket) => {
   });
 
   socket.on('audio-chunk', ({ roomId, buffer }) => {
-    const liveTracker = activeRoomTrackers.get(roomId);
-    if (liveTracker && buffer) {
-      fs.appendFile(liveTracker.audioPath, Buffer.from(buffer), (err) => {
-        if (err) console.error("⚠️ Audio write failure:", err);
-      });
-    }
+    cacheAudioChunk(roomId, buffer);
   });
 
   socket.on('chat-logged', ({ roomId, sender, text }) => {
@@ -413,8 +660,10 @@ io.on('connection', (socket) => {
 
         let voiceTranscriptText = "";
         let aiSummary = "No explicit audio telemetry gathered to generate an operations brief.";
+        let chatSummary = "No explicit historic text chat communications recorded to process.";
         let actionItems = ["Review system connectivity lines for missing audio nodes"];
         let engagementScore = 75;
+        let sessionAudioFileName = null;
 
         // ---------------------------------------------------------------------
         // PHASE 1: AUDIO SPEECH-TO-TEXT PROCESSING VIA HUGGING FACE WHISPER
@@ -441,122 +690,46 @@ io.on('connection', (socket) => {
                 const audioResult = await hfAudioResponse.json();
                 voiceTranscriptText = audioResult.text || "";
                 console.log("🟢 [HF WHISPER SUCCESS] Mic channels fully transcribed.");
+              } else {
+                const errBody = await hfAudioResponse.text();
+                console.error(`❌ [HF WHISPER] Transcription failed. Status: ${hfAudioResponse.status}. Body: ${errBody}`);
               }
             }
           } catch (e) {
             console.error("Whisper handling fallback triggered:", e.message);
           } finally {
-            fs.unlink(liveTracker.audioPath, () => {});
+            // Persist the raw recording to session_audio for the download button
+            // instead of deleting it, regardless of whether transcription succeeded.
+            sessionAudioFileName = persistSessionAudio(roomId, liveTracker.audioPath);
           }
         }
 
         // ---------------------------------------------------------------------
-        // PHASE 2: CONTEXT TRANSCRIPT SYNTHESIS (VOICE TRANSCRIPT + CHAT MESH)
+        // PHASE 2: STATIC-PROMPT AI SUMMARIES FOR AUDIO TRANSCRIPT + CHAT LOG
         // ---------------------------------------------------------------------
-        const combinedTextChatContext = liveTracker.chatLogs.map(log => `[Chat - ${log.sender}]: ${log.text}`).join("\n");
-        
-        const summaryContextPrompt = `<s>[INST] You are an automated system operations analyst. Synthesize a unified brief from this session telemetry:
+        const formattedChatLogs = liveTracker.chatLogs
+          .map(log => `[${log.timestamp}] ${log.sender}: ${log.text}`)
+          .join('\n');
 
-AUDIO TRANSCRIPT ARCHIVE:
-"${voiceTranscriptText || 'No verbal audio recorded over mic channels.'}"
+        const [{ audioSummary, chatSummary: computedChatSummary }, { engagementScore: computedEngagementScore, actionItems: computedActionItems }] =
+          await Promise.all([
+            generateChannelSummaries(voiceTranscriptText, formattedChatLogs),
+            generateEngagementAndActionItems(voiceTranscriptText, formattedChatLogs)
+          ]);
 
-CHAT FEED DATA RECOVERY:
-"${combinedTextChatContext || 'No chat communications written on track feeds.'}"
-
-Respond strictly with a single valid JSON object containing exactly these keys: "summary", "engagementScore", and "actionItems". Do not output any markdown code fences, headers, or explanations.
-
-Example output format:
-{"summary": "Text content here.", "engagementScore": 80, "actionItems": ["Task item 1"]} [/INST]`;
-
-        try {
-          console.log("⚡ [HF MISTRALAI] Compiling cross-channel data inputs into text model context...");
-          const hfTextResponse = await fetch(
-            "https://api-inference.huggingface.co/models/MistralAI/Mistral-7B-Instruct-v0.3",
-            {
-              headers: {
-                "Authorization": `Bearer ${process.env.HF_FINEGRAINED_TOKEN}`,
-                "Content-Type": "application/json"
-              },
-              method: "POST",
-              body: JSON.stringify({ 
-                inputs: summaryContextPrompt, 
-                parameters: { return_full_text: false, max_new_tokens: 300, temperature: 0.3 } 
-              }),
-            }
-          );
-
-          if (hfTextResponse.ok) {
-            const textResult = await hfTextResponse.json();
-            const rawContent = Array.isArray(textResult) ? textResult[0].generated_text : textResult.generated_text;
-            
-            const jsonSanitizationRegex = rawContent.match(/\{[\s\S]*\}/);
-            if (jsonSanitizationRegex) {
-              try {
-                const aiPayload = JSON.parse(jsonSanitizationRegex[0].trim());
-                aiSummary = aiPayload.summary || "Summary successfully compiled.";
-                engagementScore = aiPayload.engagementScore || 80;
-                actionItems = Array.isArray(aiPayload.actionItems) ? aiPayload.actionItems : ["Review system log lines"];
-              } catch (jsonErr) {
-                aiSummary = rawContent.replace(/["'{}]/g, '').substring(0, 180) + "...";
-                if (liveTracker.chatLogs.length > 0) {
-                  actionItems = liveTracker.chatLogs.slice(-2).map(c => `Follow up on statement from ${c.sender}: "${c.text}"`);
-                }
-              }
-            }
-          }
-        } catch (openaiErr) {
-          console.error("HuggingFace pipeline extraction error:", openaiErr.message);
-        }
-
-        // ---------------------------------------------------------------------
-        // PHASE 2.5: DEDICATED ARCHIVAL CHAT INSIGHTS PARAGRAPH COMPILER
-        // ---------------------------------------------------------------------
-        let chatAiParagraphSummary = "No explicit historic text chat communications recorded to process.";
-
-        if (liveTracker.chatLogs.length > 0) {
-          try {
-            console.log("🧠 [HF TEXT CHAT PROMPT ENGINE] Submitting text transcripts for dedicated professional text summarizing...");
-            const formattedChatLogs = liveTracker.chatLogs.map(log => 
-              `[${log.timestamp}] ${log.sender}: ${log.text}`
-            ).join('\n');
-
-            const staticPromptPayload = `<s>[INST] You are an enterprise communication analyzer. Ingest the following archival conversation logs and write a single, cohesive, elegant executive summary paragraph explaining the key technical consensus items, engineering discussion points, and actions taken. Do not use lists or headers.
-            
-ARCHIVAL TEXT CHAT HISTORIC RECORDS:
-${formattedChatLogs} [/INST]`;
-
-            const hfChatSummaryResponse = await fetch(
-              "https://api-inference.huggingface.co/models/MistralAI/Mistral-7B-Instruct-v0.3",
-              {
-                headers: {
-                  "Authorization": `Bearer ${process.env.HF_FINEGRAINED_TOKEN}`,
-                  "Content-Type": "application/json"
-                },
-                method: "POST",
-                body: JSON.stringify({
-                  inputs: staticPromptPayload,
-                  parameters: { return_full_text: false, max_new_tokens: 250, temperature: 0.2 }
-                })
-              }
-            );
-
-            if (hfChatSummaryResponse.ok) {
-              const resJson = await hfChatSummaryResponse.json();
-              chatAiParagraphSummary = Array.isArray(resJson) ? resJson[0].generated_text : resJson.generated_text;
-              chatAiParagraphSummary = chatAiParagraphSummary.trim();
-            }
-          } catch (chatSummaryErr) {
-            console.error("❌ Chat summary inference failed, fallback engaged:", chatSummaryErr.message);
-          }
-        }
+        aiSummary = audioSummary;
+        chatSummary = computedChatSummary;
+        engagementScore = computedEngagementScore;
+        actionItems = computedActionItems;
 
         // Expose both analytics summaries to the local map memory so client REST API calls read it immediately
         liveTracker.summaryAnalytics = {
           roomId: roomId,
           aiSummary,
-          chatAiParagraphSummary, 
+          chatSummary,
           engagementScore,
           actionItems,
+          audioFileName: sessionAudioFileName,
           timestamp: new Date().toISOString()
         };
 
@@ -585,19 +758,19 @@ ${formattedChatLogs} [/INST]`;
           doc.moveDown(1.5);
 
           // Synthesis Description Display (Voice Telemetry Summary)
-          doc.fillColor('#0284c7').fontSize(13).text('⚡ AI AUDIO TELEMETRY SYNTHESIS BRIEF', { underline: true });
+          doc.fillColor('#0284c7').fontSize(13).text('AI AUDIO SUMMARY', { underline: true });
           doc.moveDown(0.4);
-          doc.fillColor('#334155').fontSize(10).text(aiSummary, { align: 'justify', lineGap: 3 });
+          doc.font('Helvetica').fillColor('#334155').fontSize(10).text(aiSummary, { align: 'justify', lineGap: 3 });
           doc.moveDown(1.5);
 
           // Dedicated Chat Records AI Text Paragraph Brief
-          doc.fillColor('#0284c7').fontSize(13).text('🧠 AI ARCHIVAL CHAT INSIGHTS SUMMARY', { underline: true });
+          doc.fillColor('#0284c7').fontSize(13).text('AI CHAT SUMMARY', { underline: true });
           doc.moveDown(0.4);
-          doc.fillColor('#1e293b').font('Helvetica').fontSize(10).text(chatAiParagraphSummary, { align: 'justify', lineGap: 3 });
+          doc.font('Helvetica').fillColor('#1e293b').fontSize(10).text(chatSummary, { align: 'justify', lineGap: 3 });
           doc.moveDown(1.5);
 
           // Task Assignment Mapping Frame Loop
-          doc.font('Helvetica-Bold').fillColor('#0284c7').fontSize(13).text('🎯 EXTRACTED OPERATIONAL TARGET ACTIONS', { underline: true });
+          doc.font('Helvetica-Bold').fillColor('#0284c7').fontSize(13).text('EXTRACTED OPERATIONAL TARGET ACTIONS', { underline: true });
           doc.moveDown(0.4);
           doc.font('Helvetica').fillColor('#334155').fontSize(10);
           if (actionItems.length === 0) {
@@ -610,7 +783,7 @@ ${formattedChatLogs} [/INST]`;
           doc.moveDown(1.5);
 
           // Chat Feed Appendix Block
-          doc.fillColor('#64748b').fontSize(12).text('📝 ARCHIVAL TEXT CHAT HISTORIC RECORDS', { underline: true });
+          doc.fillColor('#64748b').fontSize(12).text('ARCHIVAL TEXT CHAT HISTORIC RECORDS', { underline: true });
           doc.moveDown(0.4);
           doc.font('Courier').fontSize(8.5);
           if (liveTracker.chatLogs.length === 0) {
@@ -634,8 +807,8 @@ ${formattedChatLogs} [/INST]`;
           INSERT INTO completed_sessions (
             sessionId, roomId, host, startTime, endTime, 
             durationMinutes, chatMessagesCount, peakParticipants, engagementScore, 
-            aiSummary, actionItems
-          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            aiSummary, chatSummary, audioFileName, actionItems
+          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         `);
 
         insertStmt.run(
@@ -648,7 +821,9 @@ ${formattedChatLogs} [/INST]`;
           liveTracker.chatLogs.length,
           peakParticipants,
           engagementScore,
-          aiSummary + `\n\n[CHAT INSIGHTS SUMMARY]\n` + chatAiParagraphSummary, 
+          aiSummary,
+          chatSummary,
+          sessionAudioFileName,
           JSON.stringify(actionItems),
           (err) => {
             if (err) console.error("❌ SQL Insertion Failed:", err.message);
@@ -667,6 +842,10 @@ ${formattedChatLogs} [/INST]`;
 
 server.listen(PORT, async () => {
   console.log(`\n🚀 [MATRIX INFRASTRUCTURE LIVE ON PORT ${PORT} WITH RELATIONAL SQL]`);
+
+  // ---------------------------------------------------------------------
+  // Hugging Face token check (still used for Whisper audio transcription)
+  // ---------------------------------------------------------------------
   console.log("⚡ [DIAGNOSTIC] Validating Intelmeet Fine-Grained Token status...");
   try {
     const token = process.env.HF_FINEGRAINED_TOKEN;
@@ -686,6 +865,30 @@ server.listen(PORT, async () => {
     console.log(`🟢 [PLATFORM CORE ONLINE] Authenticated as user: "${userData.name}" with token scope privileges.\n`);
   } catch (error) {
     console.error("🔴 [PLATFORM CORE OFFLINE] Fine-Grained Token validation failed!");
+    console.error(`Reason: ${error.message}`);
+  }
+
+  // ---------------------------------------------------------------------
+  // OpenAI API key check (used for audio + chat summaries and action items)
+  // ---------------------------------------------------------------------
+  console.log(`⚡ [DIAGNOSTIC] Validating OpenAI API key status (model: ${OPENAI_MODEL})...`);
+  try {
+    const openaiKey = process.env.OPENAI_API_KEY;
+    if (!openaiKey || openaiKey.startsWith("sk-YOUR_COPIED_KEY")) {
+      throw new Error("OPENAI_API_KEY missing or set to a placeholder in your .env file.");
+    }
+
+    const response = await fetch("https://api.openai.com/v1/models", {
+      headers: { "Authorization": `Bearer ${openaiKey}` }
+    });
+
+    if (!response.ok) {
+      throw new Error(`OpenAI rejected the API key. Status: ${response.status}`);
+    }
+
+    console.log("🟢 [OPENAI CORE ONLINE] API key validated successfully.\n");
+  } catch (error) {
+    console.error("🔴 [OPENAI CORE OFFLINE] OpenAI API key validation failed!");
     console.error(`Reason: ${error.message}`);
   }
 });
