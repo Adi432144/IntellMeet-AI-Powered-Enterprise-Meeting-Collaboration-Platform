@@ -25,7 +25,7 @@ app.use('/session_reports', express.static(path.join(process.cwd(), 'session_rep
 // Expose persisted full-session audio recordings for direct download
 app.use('/session_audio', express.static(path.join(process.cwd(), 'session_audio')));
 
-const PORT = 8080;
+const PORT = process.env.PORT || 8080;
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*', methods: ['GET', 'POST'] }
