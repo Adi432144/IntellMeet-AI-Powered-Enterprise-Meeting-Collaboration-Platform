@@ -241,26 +241,6 @@ app.get('/api/analytics/summary', (req, res) => {
   });
 });
 
-// POST: Inject Simulated Test Telemetry Into an Active Room
-app.post('/api/simulate-telemetry', (req, res) => {
-  const { roomId } = req.body;
-  const liveTracker = activeRoomTrackers.get(roomId);
-
-  if (!liveTracker) {
-    return res.status(404).json({ error: "Target simulation mesh room not found or inactive." });
-  }
-
-  // Inject a complete developer narrative tracking log (chats, notes, metrics context)
-  liveTracker.chatLogs.push(
-    { sender: "Operator Alpha", text: "Initializing infrastructure sync verification protocols.", timestamp: "2:59:41 pm" },
-    { sender: "Engineer Beta", text: "The WebRTC layout adapts fluidly across parallel workspace screens.", timestamp: "3:00:21 pm" },
-    { sender: "Analyst Gamma", text: "Confirmed. Ensure we trigger the final high-accuracy report compilation upon disconnect.", timestamp: "3:00:21 pm" }
-  );
-
-  console.log(`🧪 [SIMULATION TRAFFIC] Injected telemetry arrays into room: ${roomId}`);
-  return res.json({ success: true, message: "Mock engineering traffic successfully written." });
-});
-
 /**
  * @route GET /api/reports
  * @description Retrieves a list of all compiled PDF session reports from the local filesystem.
@@ -289,6 +269,31 @@ app.get('/api/audio-reports', (req, res) => {
     }
     const audioFiles = files.filter(file => file.toLowerCase().endsWith('.webm'));
     return res.json(audioFiles);
+  });
+});
+
+/**
+ * @route GET /api/download-audio/:filename
+ * @description Forces a real file download (Content-Disposition: attachment) instead of
+ * inline playback. The plain /session_audio/<file> static route serves audio/webm with no
+ * disposition header, so browsers open a playable audio player instead of saving the file —
+ * this route exists specifically so the frontend's download button actually downloads.
+ */
+app.get('/api/download-audio/:filename', (req, res) => {
+  const { filename } = req.params;
+
+  // Basic path-traversal guard — filenames should only ever be what persistSessionAudio() generates.
+  if (!filename || filename.includes('..') || filename.includes('/') || filename.includes('\\')) {
+    return res.status(400).json({ error: "Invalid audio filename." });
+  }
+
+  const filePath = path.join(AUDIO_FOLDER_PATH, filename);
+  if (!fs.existsSync(filePath)) {
+    return res.status(404).json({ error: "Requested audio file was not found on the server." });
+  }
+
+  res.download(filePath, filename, (err) => {
+    if (err) console.error(`❌ Failed to send audio file "${filename}" for download:`, err.message);
   });
 });
 
@@ -323,7 +328,7 @@ async function callOpenAIJSON(systemPrompt, userPrompt, maxTokens, logLabel) {
           { role: "user", content: userPrompt }
         ],
         response_format: { type: "json_object" },
-        max_tokens: maxTokens,
+        max_completion_tokens: maxTokens,
         temperature: 0.3
       })
     });
@@ -636,6 +641,36 @@ io.on('connection', (socket) => {
     socket.to(data.targetSocketId).emit('ice-candidate', { candidate: data.candidate, senderId: socket.id });
   });
 
+  // Host Action: Immediately kick every other participant out of the room.
+  // Unlike a normal disconnect (which only removes the disconnecting socket),
+  // this force-ends the session for everyone the moment the host terminates it.
+  socket.on('host-terminate-session', ({ roomId }) => {
+    const criteria = roomSecurityRegistry.get(roomId);
+    const isHost = criteria && criteria.hostSocketId === socket.id;
+
+    if (!isHost) {
+      console.warn(`⚠️ [Unauthorized Termination Attempt] Non-host socket "${socket.id}" tried to terminate room: "${roomId}"`);
+      return;
+    }
+
+    console.log(`🛑 [Host Termination] Host is ending session for room: "${roomId}" — kicking all participants.`);
+
+    // Tell every other socket in the room the session is over before force-disconnecting them,
+    // so their frontend can show a clear message instead of just silently dropping.
+    socket.to(roomId).emit('session-terminated', {
+      message: "The host has ended this session. You have been disconnected."
+    });
+
+    const clientsInRoom = io.sockets.adapter.rooms.get(roomId);
+    if (clientsInRoom) {
+      for (const clientSocketId of clientsInRoom) {
+        if (clientSocketId === socket.id) continue; // Host disconnects itself separately via its own leave flow
+        const clientSocket = io.sockets.sockets.get(clientSocketId);
+        if (clientSocket) clientSocket.disconnect(true);
+      }
+    }
+  });
+
   socket.on('disconnect', async () => {
     const profile = socketProfileMap.get(socket.id);
     if (!profile) return;
@@ -757,17 +792,23 @@ io.on('connection', (socket) => {
           doc.text(`Evaluated Metrics Score: ${engagementScore}%`);
           doc.moveDown(1.5);
 
-          // Synthesis Description Display (Voice Telemetry Summary)
-          doc.fillColor('#0284c7').fontSize(13).text('AI AUDIO SUMMARY', { underline: true });
-          doc.moveDown(0.4);
-          doc.font('Helvetica').fillColor('#334155').fontSize(10).text(aiSummary, { align: 'justify', lineGap: 3 });
-          doc.moveDown(1.5);
+          // Synthesis Description Display (Voice Telemetry Summary) — only shown when
+          // real audio was actually captured and transcribed for this session.
+          if (voiceTranscriptText && voiceTranscriptText.trim()) {
+            doc.fillColor('#0284c7').fontSize(13).text('AI AUDIO SUMMARY', { underline: true });
+            doc.moveDown(0.4);
+            doc.font('Helvetica').fillColor('#334155').fontSize(10).text(aiSummary, { align: 'justify', lineGap: 3 });
+            doc.moveDown(1.5);
+          }
 
-          // Dedicated Chat Records AI Text Paragraph Brief
-          doc.fillColor('#0284c7').fontSize(13).text('AI CHAT SUMMARY', { underline: true });
-          doc.moveDown(0.4);
-          doc.font('Helvetica').fillColor('#1e293b').fontSize(10).text(chatSummary, { align: 'justify', lineGap: 3 });
-          doc.moveDown(1.5);
+          // Dedicated Chat Records AI Text Paragraph Brief — only shown when there
+          // was actual chat activity in the session.
+          if (liveTracker.chatLogs.length > 0) {
+            doc.fillColor('#0284c7').fontSize(13).text('AI CHAT SUMMARY', { underline: true });
+            doc.moveDown(0.4);
+            doc.font('Helvetica').fillColor('#1e293b').fontSize(10).text(chatSummary, { align: 'justify', lineGap: 3 });
+            doc.moveDown(1.5);
+          }
 
           // Task Assignment Mapping Frame Loop
           doc.font('Helvetica-Bold').fillColor('#0284c7').fontSize(13).text('EXTRACTED OPERATIONAL TARGET ACTIONS', { underline: true });
@@ -890,5 +931,19 @@ server.listen(PORT, async () => {
   } catch (error) {
     console.error("🔴 [OPENAI CORE OFFLINE] OpenAI API key validation failed!");
     console.error(`Reason: ${error.message}`);
+  }
+});
+
+// Friendlier error message than the default unhandled-exception stack trace
+// when the port is already occupied by a previous (possibly zombie) process.
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`\n🔴 [STARTUP FAILED] Port ${PORT} is already in use by another process.`);
+    console.error(`   Windows: run "netstat -ano | findstr :${PORT}" to find the PID, then "taskkill /PID <pid> /F".`);
+    console.error(`   macOS/Linux: run "lsof -i :${PORT}" to find the PID, then "kill -9 <pid>".`);
+    process.exit(1);
+  } else {
+    console.error("🔴 [STARTUP FAILED] Unexpected server error:", err.message);
+    process.exit(1);
   }
 });
