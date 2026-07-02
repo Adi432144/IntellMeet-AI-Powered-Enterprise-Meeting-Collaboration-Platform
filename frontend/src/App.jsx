@@ -9,7 +9,7 @@ import { io } from 'socket.io-client';
 import LoginCard from './components/LoginCard';
 
 // Initialize socket client outside component lifecycle to prevent duplicate connection instances
-const socket = io('http://localhost:8080', {
+const socket = io('https://intellmeet-ai-powered-enterpris.onrender.com', {
   autoConnect: false, // Controlled explicitly via security lifecycle states
   reconnectionAttempts: 5,
   timeout: 10000
@@ -174,7 +174,7 @@ export default function App() {
   const clearSessionHistoryCache = async () => {
     if (!window.confirm("Are you sure you want to completely clear the historic session cache storage?")) return;
     try {
-      const res = await fetch('http://localhost:8080/api/history', { method: 'DELETE' });
+      const res = await fetch('https://intellmeet-ai-powered-enterpris.onrender.com/api/history', { method: 'DELETE' });
       if (res.ok) {
         setHistoryLogs([]);
         setSummaryStats({ totalMeetings: 0, totalMinutes: 0, avgEngagement: 0, peakUsersAllTime: 0 });
@@ -206,11 +206,11 @@ export default function App() {
 
   const loadHistoricalAnalytics = async () => {
     try {
-      const resHist = await fetch('http://localhost:8080/api/history');
+      const resHist = await fetch('https://intellmeet-ai-powered-enterpris.onrender.com/api/history');
       const dataHist = await resHist.json();
       setHistoryLogs(Array.isArray(dataHist) ? dataHist : [dataHist]);
 
-      const resStat = await fetch('http://localhost:8080/api/analytics/summary');
+      const resStat = await fetch('https://intellmeet-ai-powered-enterpris.onrender.com/api/analytics/summary');
       const dataStat = await resStat.json();
       setSummaryStats(dataStat);
     } catch (err) {
@@ -1154,7 +1154,7 @@ export default function App() {
                     <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px', marginTop: '12px' }}>
                       {session.audioFileName && (
                         <a
-                          href={`http://localhost:8080/api/download-audio/${session.audioFileName}`}
+                          href={`https://intellmeet-ai-powered-enterpris.onrender.com/api/download-audio/${session.audioFileName}`}
                           download
                           style={{
                             ...currentStyles.themeToggleBtn,
@@ -1173,7 +1173,7 @@ export default function App() {
                         style={{ ...currentStyles.themeToggleBtn, backgroundColor: 'rgba(56,189,248,0.1)', border: '1px solid #38bdf8', color: '#38bdf8' }}
                         onClick={async () => {
                           try {
-                            const response = await fetch('http://localhost:8080/api/reports');
+                            const response = await fetch('https://intellmeet-ai-powered-enterpris.onrender.com/api/reports');
                             const files = await response.json();
                             const targetFile = files
                               .filter(file => file.includes(cleanRoomId))
@@ -1181,7 +1181,7 @@ export default function App() {
                               .pop();
 
                             if (targetFile) {
-                              window.open(`http://localhost:8080/session_reports/${targetFile}`, '_blank');
+                              window.open(`https://intellmeet-ai-powered-enterpris.onrender.com/session_reports/${targetFile}`, '_blank');
                             } else {
                               alert(`No binary PDF report asset found compiled yet for room code: ${cleanRoomId}.`);
                             }
