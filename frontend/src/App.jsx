@@ -9,7 +9,7 @@ import { io } from 'socket.io-client';
 import LoginCard from './components/LoginCard';
 
 // Initialize socket client outside component lifecycle to prevent duplicate connection instances
-const socket = io('https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com', {
+const socket = io('http://localhost:8080', {
   autoConnect: false, // Controlled explicitly via security lifecycle states
   reconnectionAttempts: 5,
   timeout: 10000
@@ -132,6 +132,7 @@ export default function App() {
   const [roomPassword, setRoomPassword] = useState('');
   const [joinPasswordInput, setJoinPasswordInput] = useState('');
   const [activeJoinRequests, setActiveJoinRequests] = useState([]); // List of requests on Host interface
+  const [createRoomError, setCreateRoomError] = useState(''); // Real-time "room already exists" feedback
 
   // Gatekeeper states inside the room (mirrors code_1 join/create/request flow)
   const [isHostRole, setIsHostRole] = useState(false);
@@ -173,7 +174,7 @@ export default function App() {
   const clearSessionHistoryCache = async () => {
     if (!window.confirm("Are you sure you want to completely clear the historic session cache storage?")) return;
     try {
-      const res = await fetch('https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com/api/history', { method: 'DELETE' });
+      const res = await fetch('http://localhost:8080/api/history', { method: 'DELETE' });
       if (res.ok) {
         setHistoryLogs([]);
         setSummaryStats({ totalMeetings: 0, totalMinutes: 0, avgEngagement: 0, peakUsersAllTime: 0 });
@@ -205,11 +206,11 @@ export default function App() {
 
   const loadHistoricalAnalytics = async () => {
     try {
-      const resHist = await fetch('https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com/api/history');
+      const resHist = await fetch('http://localhost:8080/api/history');
       const dataHist = await resHist.json();
       setHistoryLogs(Array.isArray(dataHist) ? dataHist : [dataHist]);
 
-      const resStat = await fetch('https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com/api/analytics/summary');
+      const resStat = await fetch('http://localhost:8080/api/analytics/summary');
       const dataStat = await resStat.json();
       setSummaryStats(dataStat);
     } catch (err) {
@@ -248,10 +249,38 @@ export default function App() {
       setView('DASHBOARD');
     });
 
+    // Real-time duplicate room-name guard: fired by the backend in response to
+    // 'register-session-security' when the requested room name is already live.
+    socket.on('room-creation-allowed', ({ roomId: allowedRoomId }) => {
+      setCreateRoomError('');
+      setIsHostRole(true);
+      setIsApprovedGuest(false);
+      setRoomId(allowedRoomId);
+      setView('ROOM');
+    });
+
+    socket.on('room-creation-failed', ({ message }) => {
+      setCreateRoomError(message || 'That room name already exists. Please use a different name, or use Join Session to join the existing room.');
+    });
+
+    // Fired on every non-host participant's client the moment the host terminates
+    // the session — forces them out immediately rather than lingering in a dead room.
+    socket.on('session-terminated', ({ message }) => {
+      alert(`🛑 ${message || 'The host has ended this session. You have been disconnected.'}`);
+      terminateActiveStreams();
+      setIsHostRole(false);
+      setIsApprovedGuest(false);
+      setActiveJoinRequests([]);
+      setView('DASHBOARD');
+    });
+
     return () => {
       socket.off('join-request-received');
       socket.off('join-request-approved');
       socket.off('join-request-denied');
+      socket.off('room-creation-allowed');
+      socket.off('room-creation-failed');
+      socket.off('session-terminated');
     };
   }, [view]);
 
@@ -398,11 +427,25 @@ export default function App() {
 
   const startVoiceRecorderStreaming = (stream) => {
     try {
-      if (!MediaRecorder.isTypeSupported('video/webm;codecs=vp9') && !MediaRecorder.isTypeSupported('audio/webm')) {
-        console.warn("Target capture wrapper mismatch encoding configurations.");
+      const audioTracks = stream.getAudioTracks();
+      if (audioTracks.length === 0) {
+        console.warn("No audio track available on the media stream — skipping voice recorder setup.");
+        return;
       }
+
+      // MediaRecorder requires the stream's tracks to match the requested container.
+      // Passing the full audio+video stream while requesting an audio-only mimeType
+      // ('audio/webm') throws "There was an error starting the MediaRecorder" in Chrome,
+      // so build an audio-only stream from just the audio track(s) instead.
+      const audioOnlyStream = new MediaStream(audioTracks);
+
+      if (!MediaRecorder.isTypeSupported('audio/webm')) {
+        console.warn("audio/webm is not supported in this browser — voice recording will be skipped.");
+        return;
+      }
+
       const options = { mimeType: 'audio/webm' };
-      const recorder = new MediaRecorder(stream, options);
+      const recorder = new MediaRecorder(audioOnlyStream, options);
       voiceRecorderRef.current = recorder;
 
       recorder.ondataavailable = async (e) => {
@@ -582,6 +625,12 @@ export default function App() {
   };
 
   const handleDisconnectAction = () => {
+    // If the host is the one ending the session, kick every other participant
+    // out immediately instead of just quietly leaving and letting them linger.
+    if (isHostRole && socket.connected) {
+      socket.emit('host-terminate-session', { roomId });
+    }
+
     terminateActiveStreams();
     socket.emit('leave-room', { roomId });
     // Force an actual socket disconnect so the backend's native disconnect handler
@@ -618,12 +667,12 @@ export default function App() {
     e.preventDefault();
     if (!roomId.trim()) return alert("Room workspace label cannot remain empty.");
 
-    setIsHostRole(true);
-    setIsApprovedGuest(false);
+    setCreateRoomError('');
 
+    // Do NOT flip to the ROOM view yet — wait for the backend's real-time
+    // 'room-creation-allowed' / 'room-creation-failed' response so a duplicate
+    // room name is caught before we ever try to join it.
     socket.emit('register-session-security', { roomId: roomId.trim(), password: roomPassword });
-
-    setView('ROOM');
   };
 
   const approveIncomingGuestRequest = (requestData) => {
@@ -642,22 +691,6 @@ export default function App() {
       status: 'DENIED'
     });
     setActiveJoinRequests(prev => prev.filter(r => r.guestSocketId !== requestData.guestSocketId));
-  };
-
-  const triggerMockTelemetryPayloadInjection = async () => {
-    try {
-      const res = await fetch('https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com/api/simulate-telemetry', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId })
-      });
-      const data = await res.json();
-      if (data.success) {
-        alert("🧪 Developer Telemetry Overwrite Successful: High density operational arrays written successfully.");
-      }
-    } catch (err) {
-      console.error("Simulation framework mismatch parameters error:", err);
-    }
   };
 
   if (view === 'AUTH') {
@@ -707,6 +740,15 @@ export default function App() {
             {theme === 'NEON_CYBER' ? '☀️ Minimal Theme' : '🌙 Cyber Matrix'}
           </button>
 
+          {view === 'DASHBOARD' && (
+            <button
+              style={{ ...currentStyles.themeToggleBtn, border: '1px solid #10b981', color: '#10b981' }}
+              onClick={() => { loadHistoricalAnalytics(); setView('POST_SESSION'); }}
+            >
+              📊 Telemetry Analysis Dashboard
+            </button>
+          )}
+
           <div style={currentStyles.profileBadgeContainer} onClick={() => setShowProfileModal(true)}>
             <span style={currentStyles.avatarIcon}>👤</span>
             <span style={{ fontSize: '12px', fontWeight: '600' }}>{userName}</span>
@@ -750,13 +792,13 @@ export default function App() {
             <div style={{ display: 'flex', gap: '8px', marginBottom: '20px', backgroundColor: '#020617', padding: '4px', borderRadius: '8px', border: '1px solid #1e293b' }}>
               <button 
                 style={{ flex: 1, padding: '8px', border: 'none', borderRadius: '6px', color: '#fff', backgroundColor: dashboardOption === 'CREATE' ? '#1e293b' : 'transparent', fontWeight: 'bold', cursor: 'pointer' }}
-                onClick={() => setDashboardOption('CREATE')}
+                onClick={() => { setDashboardOption('CREATE'); setCreateRoomError(''); }}
               >
                 Create Terminal
               </button>
               <button 
                 style={{ flex: 1, padding: '8px', border: 'none', borderRadius: '6px', color: '#fff', backgroundColor: dashboardOption === 'JOIN' ? '#1e293b' : 'transparent', fontWeight: 'bold', cursor: 'pointer' }}
-                onClick={() => setDashboardOption('JOIN')}
+                onClick={() => { setDashboardOption('JOIN'); setCreateRoomError(''); }}
               >
                 Join Coordinates
               </button>
@@ -765,10 +807,38 @@ export default function App() {
             {dashboardOption === 'CREATE' ? (
               <form onSubmit={createNewAuthenticatedRoomMatrix}>
                 <label style={currentStyles.fieldLabel}>Workspace Session ID</label>
-                <input style={currentStyles.input} type="text" value={roomId} onChange={(e) => setRoomId(e.target.value)} />
+                <input
+                  style={currentStyles.input}
+                  type="text"
+                  value={roomId}
+                  onChange={(e) => { setRoomId(e.target.value); setCreateRoomError(''); }}
+                />
 
                 <label style={currentStyles.fieldLabel}>Authentication Password (Optional)</label>
                 <input style={currentStyles.input} type="password" value={roomPassword} onChange={(e) => setRoomPassword(e.target.value)} placeholder="••••••••" />
+
+                {createRoomError && (
+                  <div style={{
+                    marginTop: '12px',
+                    padding: '10px 12px',
+                    borderRadius: '8px',
+                    backgroundColor: 'rgba(239,68,68,0.1)',
+                    border: '1px solid #ef4444',
+                    color: '#ef4444',
+                    fontSize: '12px',
+                    fontWeight: 'bold',
+                    lineHeight: '1.5'
+                  }}>
+                    ⚠️ {createRoomError}{' '}
+                    <button
+                      type="button"
+                      onClick={() => { setDashboardOption('JOIN'); setCreateRoomError(''); }}
+                      style={{ background: 'none', border: 'none', color: '#ef4444', textDecoration: 'underline', cursor: 'pointer', fontSize: '12px', fontWeight: 'bold', padding: 0 }}
+                    >
+                      Switch to Join Session
+                    </button>
+                  </div>
+                )}
 
                 <button style={currentStyles.btnPrimary} type="submit">Deploy Workspace Node</button>
               </form>
@@ -834,12 +904,6 @@ export default function App() {
               {' | '}<strong>Role:</strong> <span style={{ color: '#22c55e' }}>{isHostRole ? 'HOST CONTROL' : 'SYNCHRONIZED MEMBER'}</span>
             </div>
             <div style={{ display: 'flex', gap: '12px', position: 'relative' }}>
-              <button 
-                style={{ background: 'none', border: 'none', color: '#a855f7', fontSize: '12px', fontWeight: 'bold', cursor: 'pointer' }}
-                onClick={triggerMockTelemetryPayloadInjection}
-              >
-                🧪 Simulate Dev Payload Traffic
-              </button>
               <button 
                 style={{ background: 'none', border: 'none', color: '#38bdf8', fontSize: '12px', fontWeight: 'bold', cursor: 'pointer' }}
                 onClick={() => setShowPeerRoster(!showPeerRoster)}
@@ -1059,9 +1123,18 @@ export default function App() {
                     {session.aiSummary && (
                       <div style={{ backgroundColor: 'rgba(56,189,248,0.02)', border: '1px solid rgba(56,189,248,0.1)', padding: '16px', borderRadius: '8px', marginBottom: '16px' }}>
                         <div style={{ fontSize: '11px', color: '#38bdf8', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '6px' }}>
-                          🧠 AI Intelligence Core Analytical Summary
+                          🎙️ AI Audio Summary
                         </div>
                         <p style={{ margin: 0, fontSize: '13px', lineHeight: '1.6', color: '#cbd5e1' }}>{session.aiSummary}</p>
+                      </div>
+                    )}
+
+                    {session.chatSummary && (
+                      <div style={{ backgroundColor: 'rgba(168,85,247,0.02)', border: '1px solid rgba(168,85,247,0.1)', padding: '16px', borderRadius: '8px', marginBottom: '16px' }}>
+                        <div style={{ fontSize: '11px', color: '#a855f7', fontWeight: 'bold', textTransform: 'uppercase', letterSpacing: '0.5px', marginBottom: '6px' }}>
+                          💬 AI Chat Summary
+                        </div>
+                        <p style={{ margin: 0, fontSize: '13px', lineHeight: '1.6', color: '#cbd5e1' }}>{session.chatSummary}</p>
                       </div>
                     )}
 
@@ -1078,12 +1151,29 @@ export default function App() {
                       </div>
                     )}
 
-                    <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: '12px' }}>
+                    <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '12px', marginTop: '12px' }}>
+                      {session.audioFileName && (
+                        <a
+                          href={`http://localhost:8080/api/download-audio/${session.audioFileName}`}
+                          download
+                          style={{
+                            ...currentStyles.themeToggleBtn,
+                            backgroundColor: 'rgba(168,85,247,0.1)',
+                            border: '1px solid #a855f7',
+                            color: '#a855f7',
+                            textDecoration: 'none',
+                            display: 'inline-flex',
+                            alignItems: 'center'
+                          }}
+                        >
+                          🎧 Download Session Audio
+                        </a>
+                      )}
                       <button 
                         style={{ ...currentStyles.themeToggleBtn, backgroundColor: 'rgba(56,189,248,0.1)', border: '1px solid #38bdf8', color: '#38bdf8' }}
                         onClick={async () => {
                           try {
-                            const response = await fetch('https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com/api/reports');
+                            const response = await fetch('http://localhost:8080/api/reports');
                             const files = await response.json();
                             const targetFile = files
                               .filter(file => file.includes(cleanRoomId))
@@ -1091,7 +1181,7 @@ export default function App() {
                               .pop();
 
                             if (targetFile) {
-                              window.open(`https://intellmeet-ai-powered-enterprise-meeting-hbvs.onrender.com/session_reports/${targetFile}`, '_blank');
+                              window.open(`http://localhost:8080/session_reports/${targetFile}`, '_blank');
                             } else {
                               alert(`No binary PDF report asset found compiled yet for room code: ${cleanRoomId}.`);
                             }
