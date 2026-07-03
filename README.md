@@ -48,8 +48,6 @@ IntellMeet follows a decoupled client-server architecture:
 1. **Authentication:** The user logs in, receives a session token, and accesses the front-end memory-backed workspace.
 2. **Signaling & Room Creation:** The host instantiates a room. The Node.js + Socket.IO server acts as the signaling intermediary, registering security configurations and routing WebRTC SDP offers/answers and ICE candidates.
 3. **P2P Communication:** Media streams flow directly peer-to-peer via WebRTC to minimize server bandwidth overhead, while chat messages and binary audio chunks are logged server-side.
-4. **Post-Meeting Pipeline:** Once the last participant disconnects, the server orchestrates a multi-phase pipeline:
-   $$\text{Audio Recording} \longrightarrow \text{Whisper Transcription} \longrightarrow \text{LLM Summarization \& Extraction} \longrightarrow \text{PDFKit Report Generation} \longrightarrow \text{SQLite Persistence}$$
 
 ---
 
